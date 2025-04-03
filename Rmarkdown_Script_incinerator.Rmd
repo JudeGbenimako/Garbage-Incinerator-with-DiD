@@ -1,0 +1,585 @@
+---
+title: "Impact of a Garbage Incinerator on House Prices and Optimal Placement"
+author: "Jude Chinedum Gbenimako (20240700)"
+date: '`r Sys.Date()`'
+output:
+  html_document: default
+  pdf_document: default
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+##  Background
+
+The dataset is from Kiel & McClain (1995) who follow the housing price transactions prior and post the construction of the garbage incinerator in North Andover, Massachusetts.The rumor of setting up the incinerator began after 1978 while the construction began in 1981. Its a two period cross sectional data with variables as described in our dataset data_group_45.xlsx (see: sheet 2 for description). The aim of this project is to construct a Difference-in-Differences (DiD) model to estimate the effect of distance to Incinerator from house on house prices and also estimate the optimal distance that will minimize the impact of a new garbage incinerator on house prices in the neighborhood.
+
+DiD method is a statistical technique used in econometrics that calculates the effect of a treatment ( the placement of a garbage incinerator) on an outcome (housing prices) by comparing the average change over time in the outcome variable for the treatment group to the average change over time for the control group.
+
+Therefore, the relevant questions for this project are:
+a) Does proximity to the incinerator significantly affect house 
+   prices?
+b) What other factors influence housing prices?
+c) What is the optimal distance to minimize the incinerator's impact?
+
+## Data Exploration and Preprocessing
+
+```{r}
+# Read Dataset
+library(openxlsx)
+incinerator <- read.xlsx("data_group_45.xlsx")
+```
+
+
+```{r}
+#view the first few rows of a data frame(incinerator)
+head(incinerator)
+```
+
+```{r}
+# list columns names and check current number of rows and columns
+names(incinerator)
+dim(incinerator)
+```
+There are 321 observations of 25 variables
+
+```{r}
+# Count total missing values in the dataset
+sum(is.na(incinerator))
+```
+
+There is no missing values, we proceed to check for duplicate rows
+
+```{r}
+# Check and count duplicate rows
+sum(duplicated(incinerator))
+```
+
+There is 1 duplicate row which must be removed to avoid data redundancy and ensuring a good model.
+
+```{r}
+# Check the duplicate row number
+which(duplicated(incinerator))
+```
+
+```{r}
+# Remove the duplicated row and verify
+incinerator=incinerator[-213,]
+sum(duplicated(incinerator))
+```
+There is no more duplicated row.
+
+```{r}
+# exploring and summarizing data frames
+library(summarytools)
+dfSummary(incinerator)
+
+```
+
+
+```{r}
+# missing categorical values from nbh
+# Check the  table of nbh
+table(incinerator$nbh)
+```
+
+From the summary analysis there are 7 nbh groups instead of 6 as indicated in the original dataset description. They will be treated as missing values but We are creating the new group to exist as group 0 representing all the unknown/other groups (nbh==0). Considering that group 0 is the mode, this method  of filling missing categorical values avoids introducing assumptions about the undefined category and reduced Bias, Unlike other imputation such as replacing with the mode.
+
+
+```{r}
+# Import some libraries
+suppressPackageStartupMessages(library(sandwich)) # For robust standard errors
+suppressPackageStartupMessages(library(lmtest)) # For hypothesis testing
+suppressPackageStartupMessages(library(tidyverse)) # for data science analysis and visualization
+suppressPackageStartupMessages(library(stargazer)) # for professional regression tables
+suppressPackageStartupMessages(library(car)) # Check multicollinearity using VIF
+
+```
+
+
+# Variable selection for the initial models
+
+Our outcome of interest variable is lrprice which is The natural logarithm of the selling price in 1978 dollars as it will control for inflation and also help us to easily interpret our estimates in percentage difference and logarithm also mitigate the effect of the extreme values.We will exclude all other pricing variable ("price" , "lprice" and "rprice") to avoid redundancy as they will be highly correlated. Year will not be include since y81 already captures the effect of the time period. We will investigate for the Covariates  that will improve our model performance:
+
+-  Covariates: rooms, area, larea, dist, ldist,  land, lland, baths, cbd, wind, intst, lintst,lintstsq, nbh, age, agesq ( agesq and lintstsq may captures potential non-linear effects;while nbh is a group-level covariate)
+
+-  Treatment-Relevant: nearinc, y81, y81nrinc (interaction term for treatment effect)
+
+
+```{r}
+# Check the Correlations of selected covariates with lrprice
+
+selected_vars <- incinerator[, c("lrprice", "rooms", "area", "larea", "dist", "ldist", 
+                                 "land", "lland", "baths", "cbd", "intst", "lintst", 
+                                 "lintstsq", "nbh", "age", "agesq", "wind")]
+
+# Compute correlation matrix
+cor_matrix <- cor(selected_vars, use = "complete.obs")
+
+# Extract correlations with 'lrprice'
+cor_with_lrprice <- cor_matrix["lrprice", ]
+
+# Remove 'lrprice' from the results
+cor_with_lrprice <- cor_with_lrprice[!names(cor_with_lrprice) %in% "lrprice"]
+
+# Sort correlations in descending order
+sorted_correlations <- sort(cor_with_lrprice, decreasing = TRUE)
+
+# Display sorted correlations
+print(sorted_correlations)
+
+```
+
+
+```{r}
+# Plot correlations with 'lrprice'
+cor_data <- data.frame(Variable = names(sorted_correlations), Correlation = sorted_correlations)
+ggplot(cor_data, aes(x = reorder(Variable, Correlation), y = Correlation)) +
+  geom_bar(stat = "identity", fill = "blue") +
+  coord_flip() +
+  labs(title = "Correlation with lrprice", x = "Variable", y = "Correlation") +
+  theme_minimal()
+```
+
+From the correlation coefficients and plot, we will fit our initial linear model to select the signigficant covariate that we will include in our DiD model, we will exclude area, land, dist, intst and lintstsq, since the log-transformed equivalents have higher correlation with lrprice and to avoid multicollinearity. However, we will investigate agesq for potential nonlinear effects, from domain knowledge,  historical houses can increase in value over time.
+We will now proceed to fit a linear model and use VIF (Variance Inflation Factor) to check for multicollinearity of the covariates.
+
+
+## Checking for outliers of selected variables
+
+```{r}
+# boxplots with outliers highlighted in red
+# Group 1:  variables
+group1 <- incinerator %>%
+    dplyr::select(age, agesq, cbd, larea, ldist, lland)
+
+# Group 2: Other variables
+group2 <- incinerator %>%
+    dplyr::select(rooms, baths, lintst, wind, nbh, lrprice)
+
+# Convert Group 1 to long format
+group1_long <- group1 %>%
+    tidyr::pivot_longer(cols = everything(), names_to = "Variable", values_to = "Value")
+
+# Convert Group 2 to long format
+group2_long <- group2 %>%
+    tidyr::pivot_longer(cols = everything(), names_to = "Variable", values_to = "Value")
+
+# Create boxplots for Group 1
+p1 <- ggplot(group1_long, aes(x = Variable, y = Value, fill = Variable)) +
+    geom_boxplot(outlier.color = "red", outlier.shape = 16, outlier.size = 2, alpha = 0.7) +
+    labs(
+        title = "Boxplots of Continuous Variables (Group 1)",
+        x = "Variables",
+        y = "Values"
+    ) +
+    theme_minimal(base_size = 14) +
+    theme(
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none"
+    ) +
+    scale_fill_manual(values = scales::hue_pal()(length(unique(group1_long$Variable)))) +
+    coord_flip()
+
+# Create boxplots for Group 2
+p2 <- ggplot(group2_long, aes(x = Variable, y = Value, fill = Variable)) +
+    geom_boxplot(outlier.color = "red", outlier.shape = 16, outlier.size = 2, alpha = 0.7) +
+    labs(
+        title = "Boxplots of Other Variables (Group 2)",
+        x = "Variables",
+        y = "Values"
+    ) +
+    theme_minimal(base_size = 14) +
+    theme(
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none"
+    ) +
+    scale_fill_manual(values = scales::hue_pal()(length(unique(group2_long$Variable)))) +
+    coord_flip()
+
+# Print the plots
+print(p1)
+print(p2)
+
+```
+
+From the the two red dots in the boxplots represent the outliers in the corresponding variable.age, agesq, cbd, lland, rooms, wind and lrprice have outliers. Now, since our dataset is small and we are implementing regression models, Cook's distance is idea to remove extreme observations.
+
+## Using Cook’s Distance to remove extreme observation.
+
+```{r}
+# Removing  influential observations(Outliers) identified by Cook’s distance
+m1 <- lm(lrprice ~ age + agesq +  nbh + rooms + larea + baths + lland + ldist + lintst + wind + cbd, data = incinerator)
+```
+
+
+```{r}
+# Using Cook's distance to remove extreme observations
+cooks_distances <- cooks.distance(m1)
+# Set threshold for Cook's distance
+n <- nrow(incinerator)  # Total number of observations
+threshold <- 4 / n      # Common threshold
+# Identify influential observations
+influential_obs <- which(cooks_distances > threshold)
+# Print influential observations
+print(influential_obs)
+
+```
+Cook's distance measures the influence of a data point in regression models. Data points that may have a significant impact on regression results has been removed.Note that we will not remove  observations whose Cook's Distance is below the common threshold 4/n. 4/n may not be be the stringent threshold but our dataset is small and we will be considering a robust regression model.
+
+
+
+```{r}
+# Plot Cook's distance
+plot(cooks_distances, main = "Cook's Distance", ylab = "Cook's Distance", type = "h")
+abline(h = threshold, col = "red", lty = 2)
+# Highlight influential points
+text(which(cooks_distances > threshold), cooks_distances[cooks_distances > threshold],
+labels = which(cooks_distances > threshold), col = "blue")
+```
+
+## Create a cleaned dataset without extreme values
+
+```{r}
+# Create a cleaned dataset by removing influential observations
+incinerator_cleaned <- incinerator[-influential_obs, ]
+# Check the size of the cleaned dataset
+nrow(incinerator_cleaned)
+
+```
+
+
+```{r}
+# Refiting the Model Without Outliers (cleaned dataset)
+m1_cleaned <- lm(lrprice ~ age + agesq + nbh + rooms + larea + baths + lland + ldist + lintst + wind + cbd, data = incinerator_cleaned)
+# Summarize the updated model
+#summary(m1_cleaned)
+vif(m1_cleaned)
+```
+
+From the VIF result,age agesq, lintst and cbd has VIF>10 indicating multicollinearity.Going forward, We will investigate
+
+
+## Variable transformation
+
+```{r}
+# Transformation of variables with VIF>10
+# Add 1 to 'age' and take the log as lage (we are adding 1 before taking the logarithm due to numerous zero entries in 'age')
+incinerator_cleaned$lage <- log(incinerator_cleaned$age + 1)
+# Add 1 to 'agesq' and take the log as lagesq
+incinerator_cleaned$lagesq <- log(incinerator_cleaned$agesq + 1)
+# Take the log of 'cbd' as lcbd
+incinerator_cleaned$lcbd <- log(incinerator_cleaned$cbd)
+```
+```{r}
+# Refit model after transformation
+m2_cleaned <- lm(lrprice ~ lage  +lagesq+ nbh + rooms + larea + baths + lland +lcbd  + wind +lintst +ldist, data = incinerator_cleaned)
+summary(m2_cleaned)
+vif(m2_cleaned)
+```
+
+For VIF>10 values, lage and lagesq are highly correlated as expected. So we will investigate  to  know which one to exclude.
+```{r}
+# without lagesq
+m3_cleaned <- lm(lrprice ~ lage  + nbh + rooms + larea + baths + lland +lcbd  + wind +lintst +ldist, data = incinerator_cleaned)
+summary(m3_cleaned)
+vif(m3_cleaned)
+```
+lcbd is highly correlated, so we will drop lcbd and also drop lintst and ldist from the model since they do not significantly influence lrprice.
+```{r}
+# model with  significant covariates
+m4_cleaned <- lm(lrprice ~ lage  + nbh + rooms + larea + baths + lland  + wind, data = incinerator_cleaned)
+vif(m4_cleaned)
+```
+All variables coefficients are significant and no multicollinearity.
+
+
+## Our general Difference-in-Differences (DiD) Regression Model
+
+lrprice_it = β0 + β1(y81_t) + β2(nearinc_i) + β3(y81_t × nearinc_i) + X_itγ + ε_it
+Where:
+
+β3: The DiD estimator, representing the causal effect of the incinerator on home prices.
+X_it: Covariates and ε_it is the error term
+
+## fitting regression models
+
+```{r}
+# check on the effect of incinerator without the covariates
+did1<- lm(lrprice ~ y81 + nearinc + y81:nearinc, data = incinerator_cleaned)
+summary(did1)
+```
+from y81:nearinc estimate, the 8.5% decline is not statistically significant that there is a decline after construction in 1981, probably due to omitted variables or  heteroscedasticity. We will include the covariates and perform a clustered standard errors.
+
+Now, with the covariates from m3_cleaned, we will fit multiple DiD models by adjusting the covariates that influence lrprice  to select the best simple DiD model with high predictive power.
+```{r}
+# with  "wind"
+did2<- lm(lrprice ~ y81 + nearinc + y81:nearinc + lage  + nbh + rooms + larea + baths + lland + wind, data = incinerator_cleaned)
+
+```
+
+```{r}
+#without  "wind"
+did3<- lm(lrprice ~ y81 + nearinc + y81:nearinc + lage  + nbh + rooms + larea + baths + lland, data = incinerator_cleaned)
+
+```
+
+```{r}
+# with "lagesq" to check e nonlinear effect
+did4<- lm(lrprice ~ y81 + nearinc + y81:nearinc + lagesq  + nbh + rooms + larea + baths + lland, data = incinerator_cleaned)
+
+```
+
+
+```{r}
+stargazer(did2, did3, did4, type="text")
+```
+
+
+did2 and did3 have higher Adjusted R-squared and lower standard error compared to did4, so we will proceed with did2 and did3 and finalize on the best simple regression model that we will use to contruct our final DiD model.
+
+```{r}
+# Multicollinearity test (Variance Inflation Factor - VIF)
+# Use type = "predictor" because of Higher-order terms (interactions)
+vif(did2, type = "predictor")
+
+vif(did3, type = "predictor")
+```
+Both models show low GVIF values (GVIF<5), indicating no multicollinearity issues.
+
+```{r}
+# Model Specification (Ramsey RESET Test)
+resettest(did2, power = 2:3, "fitted")
+resettest(did3, power = 2:3, "fitted")
+```
+No evidence of misspecification as p-value>005 in both models. The models does not show evidence of omitted variable bias based on the tests.Both models are in a functional linear form.
+```{r}
+# Normality test (Shapiro-Wilk Test)
+shapiro_test <- shapiro.test(residuals(did2 ))
+print(shapiro_test)
+```
+
+```{r}
+# Normality test (Shapiro-Wilk Test)
+shapiro_test <- shapiro.test(residuals(did3 ))
+print(shapiro_test)
+
+```
+
+Both models satisfy the normality assumption because p-value>0.05
+
+
+```{r}
+# Chosing best model with Model Fit (AIC/BIC) and ANOVA Test for model comparison
+AIC(did2, did3)
+BIC(did2, did3)
+anova(did2, did3)
+```
+While did2 has a slightly better AIC, indicating better predictive performance, 
+did3 has a better BIC, favoring a simpler model.But the The ANOVA test result with p-value > 0.05 indicates that the inclusion of wind in did2 does not significantly improve the model performance. Since coefficient for wind in did2 is not significant, providing little justification for its inclusion. Finally, we will chose the Simpler model did3, with fewer predictors and very close adjusted R-sqaured.
+```{r}
+## Run base regression with clustered standard errors
+library(fixest)
+
+base_did <- feols(
+    lrprice ~ i(y81) + i(nearinc) + y81:nearinc,
+    data = incinerator_cleaned, cluster = ~ nbh)
+summary(base_did)
+```
+From the coefficient of (y81:nearinc), there is a  negative impact of the incinerator's construction in 1981 for houses near it which led to a 8.45%  decline in house prices.
+
+Now, we will include our covariates and neighborhood-level fixed effects.
+
+```{r}
+# chosen econometric model
+# with nbh, run the regression with clustered standard errors
+chosen_model <- feols(
+lrprice ~ i(y81) + i(nearinc) + y81:nearinc + lage + rooms + larea + baths + lland|nbh , data = incinerator_cleaned, cluster = ~ nbh)
+# Summarize the model
+summary(chosen_model)
+```
+
+chosen_model is the chosen econometric model and further estimations will be based on it. We added clustering with nbh to account for neighborhood-level correlation in the residuals as feols will optimizes the inclusion of fixed effects by demeaning the data at the group level, which adjusts the standard errors for potential correlation within neighborhoods. The Fixed effects account for unobserved heterogeneity across neighborhoods that may influence house prices. 
+The chosen_model in feols includes both fixed effects and clustered standard errors, ensuring:
+1. simple and accurate estimation of the treatment effect.
+2. Robust standard errors that account for clustering.
+3. Efficiency in handling fixed effects.
+4. It will be redundant to test for assumption of homoscedasticity  since by default, feols computes heteroscedasticity-robust standard errors (HC1).
+
+
+```{r}
+# RESET test for chosen_model
+# Convert feols model to lm object for RESET test to run. 
+lm_model <- lm(lrprice ~ i(y81) + i(nearinc) + y81:nearinc + lage  + rooms + larea + baths + lland+nbh, data = incinerator_cleaned)
+
+reset_test <- resettest(lm_model) # Perform the RESET test
+reset_test # View the result of the RESET test
+```
+No evidence of misspecification as p-value>005 in both models. The models does not show evidence of omitted variable bias based on the tests.Both models are in a functional linear form.
+
+```{r}
+
+# Extract residuals and fitted values from the feols model
+residuals_model <- residuals(chosen_model)
+fitted_values_model <- fitted(chosen_model)
+
+# Perform Shapiro-Wilk test for normality of residuals
+shapiro_test <- shapiro.test(residuals_model)
+
+shapiro_test # View the result of the Shapiro-Wilk test
+
+```
+chosen_model satisfy the normality assumption because p-value=0.4353 > 0.05
+
+```{r}
+# Extract fixed effects for neighborhoods (nbh)
+neighborhood_effects <- fixef(chosen_model)
+print(neighborhood_effects)
+sorted_effects <- sort(neighborhood_effects, decreasing = T)
+print(sorted_effects)
+```
+These estimates reflect the differences in lrprice attributed to neighborhood-specific characteristics, holding all other predictors constant. The fixed effect (FE) estimates for the neighborhoods range from 7.40 (neighborhood 3) to 7.57 (neighborhood 0).
+
+## Compare Fixed Effects with lrprice
+```{r}
+# Overall Mean of lrprice
+mean_lrprice <- mean(incinerator_cleaned$lrprice)
+print(mean_lrprice)
+
+```
+## Compare Fixed Effects to the Mean
+```{r}
+neighborhood_effects <- fixef(chosen_model)$nbh
+deviations <- neighborhood_effects - mean_lrprice
+print(deviations)
+
+```
+All neighborhood fixed effects are negative relative to the overall mean, indicating that the fixed effects suggest house prices in each neighborhood are below the average when controlling for other factors. Also, certain neighborhoods inherently have lower house prices relative to the overall mean.
+
+
+# Optimal Distance (Turning Point or Safe Distance) calculation
+
+Optimal Distance = −β(y81:nearinc)/β(y81:nearinc:ldist)
+
+```{r}
+# Add the interaction term y81:nearinc:ldist to the chosen model
+interaction_model <- feols(
+  lrprice ~ i(y81) + i(nearinc) + y81:nearinc + y81:nearinc:ldist + lage  + rooms + larea + baths + lland| nbh, data = incinerator_cleaned, cluster = ~ nbh)
+
+# Summarize the model
+summary(interaction_model)
+
+```
+The y81:nearinc:ldist estimate (0.229440) is significant. This suggests that the negative impact of the incinerator (captured by y81:nearinc) diminishes as the distance from the incinerator increases.For every log unit increase in distance, the negative effect on house prices is reduced by 22.94%.
+```{r}
+# Extract coefficients for interaction terms
+coefficients <- coef(interaction_model)
+beta_nearinc <- coefficients["y81:nearinc"]
+beta_interaction <- coefficients["y81:nearinc:ldist"]
+
+# Calculate optimal distance (log scale)
+optimal_ldist <- -beta_nearinc / beta_interaction
+
+# Convert back to actual distance
+optimal_distance <- exp(optimal_ldist)
+cat(optimal_distance, "feet\n")
+
+```
+```{r}
+# Visualize optimal distance
+# Generate a range of distances
+ldist_seq <- seq(min(incinerator_cleaned$ldist), max(incinerator_cleaned$ldist), length.out = 100)
+
+# Calculate the treatment effect across distances
+treatment_effect <- beta_nearinc + beta_interaction * ldist_seq
+
+# Plot treatment effect
+plot(exp(ldist_seq), treatment_effect, type = "l", col = "blue",
+     xlab = "Distance to Incinerator (Feet)", 
+     ylab = "Treatment Effect on Log House Price",
+     main = "Optimal Placement of Incinerator")
+
+# Add vertical line for optimal distance
+abline(v = optimal_distance, col = "red", lty = 2)
+
+# Add label for optimal distance with computed value
+text(optimal_distance, min(treatment_effect), 
+     labels = paste("Optimal Distance =", round(optimal_distance, 2), "feet"), 
+     col = "red", pos = 4, cex = 0.9, font = 2)
+
+# Add legend
+legend("topright", legend = c("Optimal Distance"), col = "red", lty = 2)
+
+```
+
+
+```{r}
+# Since we only have two period cross sectional data, we can Validate Parallel Trends assumption using placebo test
+# Create a placebo treatment variable for pre-treatment validation
+incinerator_cleaned$placebo_treat <- ifelse(incinerator_cleaned$y81 == 0 & incinerator_cleaned$nearinc == 1, 1, 0)
+
+# Subset pre-treatment data
+pre_treatment_data <- subset(incinerator_cleaned, y81 == 0)
+
+# Fit the placebo regression model
+placebo_fixest <- feols(
+    lrprice ~ placebo_treat + lage  + rooms + larea+ baths + lland| nbh,
+    data = pre_treatment_data,
+    cluster = ~ nbh
+)
+
+# Summarize the model
+summary(placebo_fixest)
+```
+Placebo test is Using the pre-treatment period as a "pseudo-treatment" and test for differences between the groups.
+Since the coefficient placebo_treat is not significant (p=0.9887629 > 0.05), this suggests there is no systematic difference in log house prices (lrprice) between the placebo-treated (placebo_treat == 1) and placebo-control (placebo_treat == 0) groups in the pre-treatment period (1978). This validates the parallel trends assumption.(Bertrand et al., Cunningham) and (Angrist & Pischke, Abadie, Bertrand et al.)
+
+
+```{r}
+# Placebo Plot
+# Summarize average log prices by placebo treatment status
+placebo_summary <- pre_treatment_data %>%
+    group_by(placebo_treat) %>%
+    summarise(mean_lrprice = mean(lrprice), .groups = "drop")
+
+# Plot the results
+# Adjust label position to lower within the bar
+ggplot(placebo_summary, aes(x = factor(placebo_treat), y = mean_lrprice, fill = factor(placebo_treat))) +
+    geom_bar(stat = "identity", position = "dodge", color = "black") +
+    geom_text(aes(label = round(mean_lrprice, 2)), vjust = 1.5, size = 5, fontface = "bold", color = "white") + # Lower text
+    scale_fill_manual(
+        values = c("0" = "skyblue", "1" = "lightgreen"),
+        name = "Placebo Treatment",
+        labels = c("Avg: 11.32", "Avg: 10.93")
+    ) +
+    labs(
+        title = "Placebo Test: Pre-Treatment Log House Prices (1978)",
+        x = "Placebo Treatment (0 = Control, 1 = Treated)",
+        y = "Average Log Price (lrprice)"
+    ) +
+    theme_minimal() +
+    theme(legend.position = "top")
+```
+
+## Interpretation of the Bar Chart
+Bars Representing placebo_treat Groups:
+
+The blue bar corresponds to the control group (placebo_treat == 0), while the green bar represents the treated group (placebo_treat == 1) in the pre-treatment year (1978).
+The average log house prices (lrprice) for the two groups are nearly identical.
+Implication:
+
+The lack of a meaningful difference between the two groups' average log prices in 1978 supports the parallel trends assumption.
+It suggests that in the absence of treatment (incinerator effect), the log house prices for the treated and control groups would have followed similar trends over time.
+
+The insignificant coefficient for placebo_treat in the placebo regression model (p=0.9887629) aligns with the visual evidence, further confirming no pre-existing differences.
+
+Since the placebo test supports parallel trends, we can be confident in our estimates.
+
+## Event Study Analysis
+Conducting and plotting an event study with only two periods (pre-treatment and post-treatment) in cross-sectional data is inherently limited, as traditional event studies rely on multiple time periods to assess dynamic treatment effects over time. Therefore, we are using placebo test and plot to supports parallel trends assumption.
+
+
+
